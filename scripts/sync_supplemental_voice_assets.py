@@ -57,6 +57,19 @@ def changes_under(repo: Path, old_commit: str, new_commit: str, base_path: str) 
     return [(fields[index], fields[index + 1]) for index in range(0, len(fields), 2)]
 
 
+def source_assets(repo: Path, commit: str, base_path: str) -> list[str]:
+    raw = subprocess.check_output(
+        ["git", "ls-tree", "-r", "--name-only", "-z", commit, "--", base_path],
+        cwd=repo,
+    )
+    return [path for path in raw.decode("utf-8").split("\0") if path]
+
+
+def tracked_assets() -> set[str]:
+    raw = subprocess.check_output(["git", "ls-files", "-z", "--", "current"], cwd=ROOT)
+    return {path for path in raw.decode("utf-8").split("\0") if path}
+
+
 def destination(source_path: str, base_path: str) -> str | None:
     prefix = base_path.rstrip("/") + "/"
     if not source_path.startswith(prefix):
@@ -99,15 +112,24 @@ def main() -> None:
         old_commit,
         ROOT / ".cache/upstream-voices-supplemental",
     )
-    if new_commit == old_commit:
-        print(f"Supplemental source already current at {new_commit[:12]}.")
-        return
+    commit_changed = new_commit != old_commit
+    changes_by_target: dict[str, tuple[str, str, str]] = {}
+    if commit_changed:
+        for status, asset_path in changes_under(upstream, old_commit, new_commit, source["path"]):
+            target = destination(asset_path, source["path"])
+            if target:
+                changes_by_target[target] = (status, asset_path, target)
 
-    changes: list[tuple[str, str, str]] = []
-    for status, asset_path in changes_under(upstream, old_commit, new_commit, source["path"]):
+    # The supplemental mirror is also an inventory fallback. Checking the full
+    # tree repairs clips that predate the saved source commit but are absent from
+    # this repository, instead of waiting for those paths to change upstream.
+    tracked = tracked_assets()
+    for asset_path in source_assets(upstream, new_commit, source["path"]):
         target = destination(asset_path, source["path"])
-        if target:
-            changes.append((status, asset_path, target))
+        if target and target not in tracked and target not in changes_by_target:
+            changes_by_target[target] = ("A", asset_path, target)
+
+    changes = list(changes_by_target.values())
 
     removed = [asset_path for status, asset_path, _ in changes if status == "D"]
     if removed:
@@ -149,11 +171,17 @@ def main() -> None:
         target.write_bytes(downloaded[asset_path])
         staged.append(target_path)
 
-    source["sourceCommit"] = new_commit
-    source["importedOn"] = datetime.now(timezone.utc).date().isoformat()
-    SOURCE_FILE.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    stage(staged + [SOURCE_FILE.name])
-    print(f"Advanced supplemental source to {new_commit[:12]}; synced {len(staged)} clips.")
+    metadata: list[str] = []
+    if commit_changed:
+        source["sourceCommit"] = new_commit
+        source["importedOn"] = datetime.now(timezone.utc).date().isoformat()
+        SOURCE_FILE.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        metadata.append(SOURCE_FILE.name)
+    stage(staged + metadata)
+    if staged:
+        print(f"Checked supplemental source {new_commit[:12]}; synced {len(staged)} clips.")
+    else:
+        print(f"Supplemental source and inventory are current at {new_commit[:12]}.")
 
 
 if __name__ == "__main__":
