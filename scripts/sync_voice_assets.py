@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -152,7 +151,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    subprocess.run(
-        [sys.executable, str(ROOT / "scripts/sync_supplemental_voice_assets.py")],
-        check=True,
-    )
