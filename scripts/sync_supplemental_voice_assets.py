@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Incrementally mirror one public upstream operator-voice directory."""
+"""Incrementally mirror MP3 recordings from a supplemental public voice source."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import subprocess
-import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -65,12 +64,13 @@ def destination(source_path: str, base_path: str) -> str | None:
     relative = PurePosixPath(source_path[len(prefix):])
     if len(relative.parts) < 2 or relative.suffix.lower() != ".mp3":
         return None
-    return str(PurePosixPath("current") / relative)
+    return str(PurePosixPath("current", *relative.parts[:-1], relative.name.lower()))
 
 
-def raw_url(repository: str, commit: str, path: str) -> str:
+def raw_url(repository: str, commit: str, asset_path: str) -> str:
     owner_repo = repository.removeprefix("https://github.com/").removesuffix(".git")
-    return f"https://raw.githubusercontent.com/{owner_repo}/{commit}/{urllib.parse.quote(path, safe='/')}"
+    encoded_path = urllib.parse.quote(asset_path, safe="/")
+    return f"https://raw.githubusercontent.com/{owner_repo}/{commit}/{encoded_path}"
 
 
 def download(url: str) -> bytes:
@@ -86,73 +86,75 @@ def stage(paths: list[str]) -> None:
 
 
 def main() -> None:
-    source = json.loads(SOURCE_FILE.read_text(encoding="utf-8"))
+    manifest = json.loads(SOURCE_FILE.read_text(encoding="utf-8"))
+    source = manifest.get("supplementalSource")
+    if not source:
+        print("No supplemental voice source configured.")
+        return
+
     old_commit = source["sourceCommit"]
     upstream, new_commit = ensure_upstream(
-        source["sourceRepository"], source["sourceBranch"], old_commit, ROOT / ".cache/upstream-voices"
+        source["sourceRepository"],
+        source["sourceBranch"],
+        old_commit,
+        ROOT / ".cache/upstream-voices-supplemental",
     )
     if new_commit == old_commit:
-        print(f"Already current at {new_commit[:12]}.")
+        print(f"Supplemental source already current at {new_commit[:12]}.")
         return
 
     changes: list[tuple[str, str, str]] = []
-    for status, path in changes_under(upstream, old_commit, new_commit, source["path"]):
-        target = destination(path, source["path"])
+    for status, asset_path in changes_under(upstream, old_commit, new_commit, source["path"]):
+        target = destination(asset_path, source["path"])
         if target:
-            changes.append((status, path, target))
+            changes.append((status, asset_path, target))
 
-    removed = [path for status, path, _ in changes if status == 'D']
+    removed = [asset_path for status, asset_path, _ in changes if status == "D"]
     if removed:
-        raise RuntimeError(f'Upstream removed {len(removed)} recordings; review archival/mapping before syncing. Nothing will be deleted.')
+        raise RuntimeError(
+            f"Supplemental source removed {len(removed)} recordings; review before syncing."
+        )
     if len(changes) > 1500:
-        raise RuntimeError(f'Unexpected bulk voice replacement ({len(changes)}); review upstream before proceeding.')
+        raise RuntimeError(
+            f"Unexpected bulk supplemental replacement ({len(changes)}); review upstream."
+        )
 
     downloaded: dict[str, bytes] = {}
     with ThreadPoolExecutor(max_workers=16) as pool:
         futures = {
-            pool.submit(download, raw_url(source["sourceRepository"], new_commit, path)): path
-            for status, path, _ in changes if status != "D"
+            pool.submit(download, raw_url(source["sourceRepository"], new_commit, asset_path)): asset_path
+            for status, asset_path, _ in changes
         }
         for future in as_completed(futures):
-            path = futures[future]
+            asset_path = futures[future]
             data = future.result()
             if not 0 < len(data) < 100 * 1024 * 1024:
-                raise ValueError(f'Empty or oversized audio: {path}')
-            expected = run('git', 'rev-parse', f'{new_commit}:{path}', cwd=upstream, capture=True)
-            actual = hashlib.sha1(f'blob {len(data)}\0'.encode() + data).hexdigest()
+                raise ValueError(f"Empty or oversized audio: {asset_path}")
+            expected = run("git", "rev-parse", f"{new_commit}:{asset_path}", cwd=upstream, capture=True)
+            actual = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
             if actual != expected:
-                raise ValueError(f'Upstream voice hash mismatch: {path}')
-            # Decode every changed recording before any files are staged.
-            subprocess.run(['ffmpeg', '-v', 'error', '-xerror', '-i', 'pipe:0', '-f', 'null', '-'],
-                           input=data, check=True, timeout=60)
-            downloaded[path] = data
+                raise ValueError(f"Upstream voice hash mismatch: {asset_path}")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-xerror", "-i", "pipe:0", "-f", "null", "-"],
+                input=data,
+                check=True,
+                timeout=60,
+            )
+            downloaded[asset_path] = data
 
     staged: list[str] = []
-    added_or_updated = deleted = 0
-    for status, upstream_path, target_path in changes:
+    for _, asset_path, target_path in changes:
         target = ROOT / target_path
-        if status == "D":
-            run("git", "update-index", "--force-remove", "--", target_path, cwd=ROOT)
-            deleted += 1
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(downloaded[upstream_path])
-            staged.append(target_path)
-            added_or_updated += 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(downloaded[asset_path])
+        staged.append(target_path)
 
     source["sourceCommit"] = new_commit
     source["importedOn"] = datetime.now(timezone.utc).date().isoformat()
-    SOURCE_FILE.write_text(json.dumps(source, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    SOURCE_FILE.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     stage(staged + [SOURCE_FILE.name])
-    print(
-        f"Advanced source to {new_commit[:12]}; synced {added_or_updated} added/updated "
-        f"and {deleted} deleted clips."
-    )
+    print(f"Advanced supplemental source to {new_commit[:12]}; synced {len(staged)} clips.")
 
 
 if __name__ == "__main__":
     main()
-    subprocess.run(
-        [sys.executable, str(ROOT / "scripts/sync_supplemental_voice_assets.py")],
-        check=True,
-    )
