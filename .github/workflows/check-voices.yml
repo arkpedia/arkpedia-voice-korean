@@ -24,6 +24,8 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Test voice sync precedence
+        run: python -m unittest discover -s scripts -p 'test_*.py'
       - name: Install FFmpeg
         run: |
           sudo apt-get update
